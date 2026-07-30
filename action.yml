@@ -6,7 +6,8 @@ branding:
 inputs:
   pairs:
     description: |
-      Multiline list of key=value lines.
+      Multiline list of secrets.
+      Supports key=value (single-line) and key<<DELIM...DELIM (multiline).
       key becomes filename under the secret dir.
       Example:
         secret_name1=secret_value1
@@ -33,41 +34,42 @@ runs:
       env:
         # We map the input to an env var to avoid a shell quote injection
         INPUT_PAIRS: ${{ inputs.pairs }}
+        INPUT_DIR: ${{ inputs.dir }}
+        INPUT_OWNER: ${{ inputs.owner }}
+        INPUT_FAIL_ON_EMPTY: ${{ inputs.fail_on_empty }}
       run: |
         # 1. Check .dockerignore
         if [[ ! -f .dockerignore ]]; then
           echo ".dockerignore not found"
           exit 1
         fi
-        dir='${{ inputs.dir }}'
+        dir="$INPUT_DIR"
         case "$dir" in
-          /*|*..* ) echo "Refusing unsafe dir path: $dir"; exit 1 ;;
+          ""|/*|*..* ) echo "Refusing unsafe dir path: $dir"; exit 1 ;;
         esac
-        grep -qxF "$dir" .dockerignore || { echo "Secrets ignore does not exist"; exit 1; }
+        grep -qxF -- "$dir" .dockerignore || { echo "Secrets ignore does not exist"; exit 1; }
 
         # 2. Setup directory
         umask 077
-        mkdir -p "$dir"
+        mkdir -p -- "$dir"
 
-        fail_on_empty='${{ inputs.fail_on_empty }}'
+        fail_on_empty="$INPUT_FAIL_ON_EMPTY"
         fail_on_empty="${fail_on_empty,,}"  # to lowercase
+        case "$fail_on_empty" in
+          true|false) ;;
+          *)
+            echo "Invalid fail_on_empty value: '$INPUT_FAIL_ON_EMPTY' (expected true or false)"
+            exit 1
+            ;;
+        esac
+
+        written_files=()
 
         # 3. Parse secrets from env var
-        while IFS= read -r line; do
-          # Remove leading/trailing whitespace from the whole line (optional)
-          line="${line#"${line%%[![:space:]]*}"}"
-          line="${line%"${line##*[![:space:]]}"}"
-          [[ -z "$line" ]] && continue
-          [[ "$line" =~ ^# ]] && continue
-          
-          if [[ "$line" =~ ^([^=[:space:]]+)[[:space:]]*=(.*)$ ]]; then
-            key="${BASH_REMATCH[1]}"
-            val="${BASH_REMATCH[2]}"
-          else
-            echo "Invalid pairs line (missing '='): $line"
-            exit 1
-          fi
-          
+        write_secret() {
+          local key="$1"
+          local val="$2"
+
           # Security: Strict filename validation
           if [[ ! "$key" =~ ^[A-Za-z0-9._-]+$ ]]; then
             echo "Invalid key/filename: $key"
@@ -80,8 +82,65 @@ runs:
           fi
 
           printf '%s' "$val" > "$dir/$key"
+          written_files+=("$dir/$key")
+        }
+
+        heredoc_key=""
+        heredoc_delim=""
+        heredoc_val=""
+        regex_single='^([^=[:space:]]+)[[:space:]]*=(.*)$'
+        regex_heredoc='^([^=[:space:]]+)[[:space:]]*<<[[:space:]]*([A-Za-z0-9._-]+)$'
+
+        while IFS= read -r line || [[ -n "$line" ]]; do
+          if [[ -n "$heredoc_key" ]]; then
+            if [[ "$line" == "$heredoc_delim" ]]; then
+              write_secret "$heredoc_key" "$heredoc_val"
+              heredoc_key=""
+              heredoc_delim=""
+              heredoc_val=""
+            else
+              if [[ -n "$heredoc_val" ]]; then
+                heredoc_val+=$'\n'
+              fi
+              heredoc_val+="$line"
+            fi
+            continue
+          fi
+
+          # Remove leading/trailing whitespace from control lines.
+          trimmed="$line"
+          trimmed="${trimmed#"${trimmed%%[![:space:]]*}"}"
+          trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+          [[ -z "$trimmed" ]] && continue
+          [[ "$trimmed" =~ ^# ]] && continue
+
+          if [[ "$trimmed" =~ $regex_single ]]; then
+            key="${BASH_REMATCH[1]}"
+            val="${BASH_REMATCH[2]}"
+            write_secret "$key" "$val"
+          elif [[ "$trimmed" =~ $regex_heredoc ]]; then
+            heredoc_key="${BASH_REMATCH[1]}"
+            heredoc_delim="${BASH_REMATCH[2]}"
+            heredoc_val=""
+          else
+            echo "Invalid pairs line. Use key=value or key<<DELIM: $line"
+            exit 1
+          fi
         done <<< "$INPUT_PAIRS"
 
+        if [[ -n "$heredoc_key" ]]; then
+          echo "Unterminated multiline value for: $heredoc_key (missing delimiter '$heredoc_delim')"
+          exit 1
+        fi
+
         # 4. Secure Ownership
-        owner='${{ inputs.owner }}'
-        chown "$owner" "$dir" "$dir"/*
+        owner="$INPUT_OWNER"
+        if [[ -z "$owner" ]]; then
+          echo "owner input must not be empty"
+          exit 1
+        fi
+        if (( ${#written_files[@]} > 0 )); then
+          chown -- "$owner" "$dir" "${written_files[@]}"
+        else
+          chown -- "$owner" "$dir"
+        fi

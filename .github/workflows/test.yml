@@ -100,6 +100,41 @@ jobs:
           test -f secrets-dir/token
           test "$(cat secrets-dir/token)" = "abc123"
 
+  success-multiline-heredoc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare .dockerignore
+        run: |
+          printf '%s\n' '.ci-secrets' > .dockerignore
+
+      - name: Run action with multiline + single-line entries
+        uses: ./
+        with:
+          owner: "${{ runner.uid }}:${{ runner.gid }}"
+          pairs: |
+            maven_settings_xml<<END_XML
+            <settings>
+              <server>a=b</server>
+
+              # this line is part of the secret content
+            </settings>
+            END_XML
+            npm_token=abc123
+
+      - name: Assert multiline content preserved exactly
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "<settings>
+            <server>a=b</server>
+
+            # this line is part of the secret content
+          </settings>" > expected.xml
+          diff -u expected.xml .ci-secrets/maven_settings_xml
+          test "$(cat .ci-secrets/npm_token)" = "abc123"
+
   fail-missing-dockerignore:
     runs-on: ubuntu-latest
     steps:
@@ -117,6 +152,30 @@ jobs:
           owner: "${{ runner.uid }}:${{ runner.gid }}"
           pairs: |
             a=b
+
+      - name: Assert failed
+        run: |
+          test "${{ steps.act.outcome }}" = "failure"
+
+  fail-unterminated-multiline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare .dockerignore
+        run: |
+          printf '%s\n' '.ci-secrets' > .dockerignore
+
+      - name: Run action with unterminated multiline value (expect failure)
+        id: act
+        continue-on-error: true
+        uses: ./
+        with:
+          owner: "${{ runner.uid }}:${{ runner.gid }}"
+          pairs: |
+            broken<<EOT
+            line 1
+            line 2
 
       - name: Assert failed
         run: |
@@ -222,6 +281,30 @@ jobs:
         run: |
           test "${{ steps.act.outcome }}" = "failure"
 
+  fail-empty-multiline-when-enabled:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare .dockerignore
+        run: |
+          printf '%s\n' '.ci-secrets' > .dockerignore
+
+      - name: Run action with empty multiline value (expect failure)
+        id: act
+        continue-on-error: true
+        uses: ./
+        with:
+          owner: "${{ runner.uid }}:${{ runner.gid }}"
+          fail_on_empty: "true"
+          pairs: |
+            empty_multiline<<EOF
+            EOF
+
+      - name: Assert failed
+        run: |
+          test "${{ steps.act.outcome }}" = "failure"
+
   fail-on-empty-true:
     runs-on: ubuntu-latest
     steps:
@@ -267,3 +350,48 @@ jobs:
           set -euo pipefail
           test -f .ci-secrets/empty
           test "$(wc -c < .ci-secrets/empty)" -eq 0
+
+  success-no-secret-entries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare .dockerignore
+        run: |
+          printf '%s\n' '.ci-secrets' > .dockerignore
+
+      - name: Run action with comment-only pairs (should succeed)
+        uses: ./
+        with:
+          owner: "${{ runner.uid }}:${{ runner.gid }}"
+          pairs: |
+            # intentionally empty
+
+      - name: Assert directory exists and no files were created
+        run: |
+          set -euo pipefail
+          test -d .ci-secrets
+          test -z "$(find .ci-secrets -mindepth 1 -maxdepth 1 -print -quit)"
+
+  fail-invalid-fail-on-empty:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare .dockerignore
+        run: |
+          printf '%s\n' '.ci-secrets' > .dockerignore
+
+      - name: Run action with invalid fail_on_empty value (expect failure)
+        id: act
+        continue-on-error: true
+        uses: ./
+        with:
+          owner: "${{ runner.uid }}:${{ runner.gid }}"
+          fail_on_empty: "maybe"
+          pairs: |
+            a=b
+
+      - name: Assert failed
+        run: |
+          test "${{ steps.act.outcome }}" = "failure"
